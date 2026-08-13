@@ -158,6 +158,15 @@ class OpenAIServingChat(GenerateBaseServing):
 
         self.enable_prompt_tokens_details = enable_prompt_tokens_details
         self.enable_force_include_usage = enable_force_include_usage
+        # Moonshot's chat API returns streaming `usage` unconditionally, whereas
+        # upstream vLLM only emits it when `stream_options.include_usage` is set
+        # (per the OpenAI spec). For Kimi-K3 parity, default the *final-chunk*
+        # usage on for streaming requests that did not opt in. This does NOT
+        # enable per-chunk (continuous) usage, so streams that already set
+        # `include_usage` are unaffected.
+        self.force_include_usage_for_k3 = (
+            getattr(self.model_config, "tokenizer_mode", None) == "kimi_k3"
+        )
         self.enable_per_request_metrics = enable_per_request_metrics
         self.default_sampling_params = self.model_config.get_diff_sampling_param()
         mc = self.model_config
@@ -481,6 +490,12 @@ class OpenAIServingChat(GenerateBaseServing):
         include_usage, include_continuous_usage = should_include_usage(
             stream_options, self.enable_force_include_usage
         )
+        # Kimi-K3 parity: emit the final usage chunk even when the client did
+        # not set `stream_options.include_usage` (Moonshot always returns it).
+        # Leave `include_continuous_usage` untouched so per-chunk usage is only
+        # sent when explicitly requested.
+        if self.force_include_usage_for_k3:
+            include_usage = True
 
         last_res: RequestOutput | None = None
         try:
