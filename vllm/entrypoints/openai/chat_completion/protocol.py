@@ -3,6 +3,7 @@
 
 # Adapted from
 # https://github.com/lm-sys/FastChat/blob/168ccc29d3f7edc50823016105c024fe2282732a/fastchat/protocol/openai_api_protocol.py
+import re
 import time
 from typing import Annotated, Any, ClassVar, Literal
 
@@ -203,6 +204,94 @@ class ChatCompletionToolsParam(OpenAIBaseModel):
 
 class ChatCompletionNamedFunction(OpenAIBaseModel):
     name: str
+
+
+def _has_message_level_tools(messages: Any) -> bool:
+    """Whether any message carries a message-level tool declaration.
+
+    Mirrors the roles that `parse_chat_messages` passes through to the chat
+    template ("system", "developer").
+    """
+    if not isinstance(messages, list):
+        return False
+    return any(
+        isinstance(msg, dict)
+        and msg.get("role") in ("system", "developer")
+        and bool(msg.get("tools"))
+        for msg in messages
+    )
+
+
+# Roles allowed to carry message-level ("dynamic") tool declarations. Mirrors
+# `_has_message_level_tools` / the roles `parse_chat_messages` forwards to the
+# chat template.
+_DYNAMIC_TOOL_ROLES = ("system", "developer")
+# A valid function/tool name: begins with a letter or underscore, followed by
+# up to 255 letters/digits/underscores (max length 256), per the OpenAI
+# function-name contract.
+_TOOL_NAME_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]{0,255}$")
+
+
+def _iter_tool_names(tools: Any):
+    """Yield `function.name` for each well-formed tool dict in `tools`.
+
+    Defensive: silently skips anything that is not a `{"function": {"name": ...}}`
+    shaped dict, so it can be used for cross-source duplicate detection without
+    duplicating structural validation.
+    """
+    if not isinstance(tools, list):
+        return
+    for tool in tools:
+        if not isinstance(tool, dict):
+            continue
+        function = tool.get("function")
+        if not isinstance(function, dict):
+            continue
+        name = function.get("name")
+        if isinstance(name, str):
+            yield name
+
+
+def _validate_dynamic_tool(tool: Any, parameter: str) -> str:
+    """Validate a single message-level tool dict; return its function name.
+
+    Raises `VLLMValidationError` (-> HTTP 400) on any structural problem,
+    mirroring what the request-level `ChatCompletionToolsParam` pydantic
+    model already enforces for global `tools`.
+    """
+    if not isinstance(tool, dict):
+        raise VLLMValidationError(
+            f"Each message-level tool must be a JSON object, got "
+            f"{type(tool).__name__}.",
+            parameter=parameter,
+        )
+    if "type" not in tool:
+        raise VLLMValidationError(
+            "Each message-level tool must have a `type` field.",
+            parameter=f"{parameter}.type",
+        )
+    tool_type = tool.get("type")
+    if tool_type != "function":
+        raise VLLMValidationError(
+            f"Unsupported message-level tool type {tool_type!r}; only "
+            '"function" is supported.',
+            parameter=f"{parameter}.type",
+        )
+    function = tool.get("function")
+    if not isinstance(function, dict):
+        raise VLLMValidationError(
+            "Each message-level tool must have a `function` object.",
+            parameter=f"{parameter}.function",
+        )
+    name = function.get("name")
+    if not isinstance(name, str) or not _TOOL_NAME_RE.match(name):
+        raise VLLMValidationError(
+            f"Invalid message-level tool name {name!r}; names must match "
+            f"{_TOOL_NAME_RE.pattern} (start with a letter/underscore, only "
+            "letters/digits/underscores, max length 256).",
+            parameter=f"{parameter}.function.name",
+        )
+    return name
 
 
 class ChatCompletionNamedToolChoiceParam(OpenAIBaseModel):
@@ -599,8 +688,15 @@ class ChatCompletionRequest(OpenAIBaseModel):
             # No-tools requests default to tool_choice="none" at the API
             # layer. Collapse that default before rendering, so K3 emits a
             # model-visible tool-choice instruction only for requests with a
-            # tools block.
-            tool_choice=self.tool_choice if self.tools else None,
+            # tools block. Message-level tool declarations count as tools
+            # here, and an explicitly provided tool_choice is always kept.
+            tool_choice=(
+                self.tool_choice
+                if self.tools
+                or _has_message_level_tools(self.messages)
+                or "tool_choice" in self.model_fields_set
+                else None
+            ),
             response_format=self.response_format,
         )
 
@@ -912,9 +1008,13 @@ class ChatCompletionRequest(OpenAIBaseModel):
                 parameter="tools",
             )
 
-        # if "tool_choice" is not specified but tools are provided,
-        # default to "auto" tool_choice
-        if "tool_choice" not in data and data.get("tools"):
+        # Extend the tool_choice="auto" default to tools declared on
+        # individual messages, not just request-level `tools`. Otherwise the
+        # field default "none" would make templates instruct the model NOT to
+        # call the very tools the client just declared.
+        if "tool_choice" not in data and (
+            data.get("tools") or _has_message_level_tools(data.get("messages"))
+        ):
             data["tool_choice"] = "auto"
 
         # if "tool_choice" is "none" -- no validation is needed for tools
@@ -923,10 +1023,18 @@ class ChatCompletionRequest(OpenAIBaseModel):
 
         # if "tool_choice" is specified -- validation
         if "tool_choice" in data and data["tool_choice"] is not None:
-            # ensure that if "tool choice" is specified, tools are present
-            if "tools" not in data or data["tools"] is None:
+            # "required"/named tool_choice is contradictory without any tool
+            # source (request-level `tools` OR message-level declarations).
+            # "auto"/"none" without tools are harmless no-ops.
+            if (
+                data["tool_choice"] == "required"
+                or isinstance(data["tool_choice"], dict)
+            ) and not (
+                data.get("tools") or _has_message_level_tools(data.get("messages"))
+            ):
                 raise VLLMValidationError(
-                    "When using `tool_choice`, `tools` must be set.",
+                    "When using `tool_choice`, tools must be declared either "
+                    "at the request level or on individual messages.",
                     parameter="tool_choice",
                 )
 
@@ -970,16 +1078,94 @@ class ChatCompletionRequest(OpenAIBaseModel):
                         f" in `tool_choice`! {correct_usage_message}",
                         parameter="tool_choice.function.name",
                     )
-                for tool in data["tools"]:
+                # Only cross-check the name against request-level `tools`
+                # when they are present; the named tool may be declared at
+                # the message level, which is not visible here.
+                for tool in data.get("tools") or []:
                     if tool["function"]["name"] == function_name:
                         valid_tool = True
                         break
-                if not valid_tool:
+                if data.get("tools") and not valid_tool:
                     raise VLLMValidationError(
                         "The tool specified in `tool_choice` does not match any"
                         " of the specified `tools`",
                         parameter="tool_choice",
                     )
+        return data
+
+    @model_validator(mode="before")
+    @classmethod
+    def check_message_level_tools(cls, data):
+        """Validate message-level ("dynamic") tools before generation.
+
+        PR #50228 lets system/developer messages carry a `tools` array that is
+        forwarded verbatim to the chat template. Those message bodies are plain
+        TypedDicts, so pydantic performs no structural validation on them and
+        malformed declarations would be silently used (returning 200) instead of
+        rejected (400). This extends to message-level tools the enforcement that
+        `ChatCompletionToolsParam` + `check_tool_usage` already apply to
+        request-level `tools`, so both sources behave alike.
+        """
+        if isinstance(data, ValueError):
+            raise data
+        if not isinstance(data, dict):
+            return data
+        messages = data.get("messages")
+        if not isinstance(messages, list):
+            return data
+
+        # Names seen so far, spanning request-level `tools` and every
+        # message-level declaration, for cross-source duplicate detection.
+        seen_names: set[str] = set(_iter_tool_names(data.get("tools")))
+
+        for idx, msg in enumerate(messages):
+            if not isinstance(msg, dict) or "tools" not in msg:
+                continue
+            msg_tools = msg.get("tools")
+            if msg_tools is None:
+                continue
+
+            parameter = f"messages[{idx}].tools"
+            # Only system/developer messages may carry tools.
+            if msg.get("role") not in _DYNAMIC_TOOL_ROLES:
+                raise VLLMValidationError(
+                    "Message-level tools may only be declared on "
+                    f"{'/'.join(_DYNAMIC_TOOL_ROLES)} messages, not on a "
+                    f"{msg.get('role')!r} message.",
+                    parameter=parameter,
+                )
+            # A tools-bearing message must not also carry non-empty content.
+            if msg.get("content"):
+                raise VLLMValidationError(
+                    "A message that declares `tools` must have empty content.",
+                    parameter=f"messages[{idx}].content",
+                )
+            if not isinstance(msg_tools, list):
+                raise VLLMValidationError(
+                    "Message-level `tools` must be a JSON array, got "
+                    f"{type(msg_tools).__name__}.",
+                    parameter=parameter,
+                )
+            if not msg_tools:
+                raise VLLMValidationError(
+                    "Message-level `tools` must not be an empty array. "
+                    "Either provide at least one tool or omit the field.",
+                    parameter=parameter,
+                )
+
+            for tool_idx, tool in enumerate(msg_tools):
+                name = _validate_dynamic_tool(
+                    tool, f"{parameter}[{tool_idx}]"
+                )
+                if name in seen_names:
+                    raise VLLMValidationError(
+                        f"Duplicate tool name {name!r}; tool names must be "
+                        "unique across request-level and all message-level "
+                        "tool declarations.",
+                        parameter=f"{parameter}[{tool_idx}].function.name",
+                    )
+                seen_names.add(name)
+
         return data
 
     @model_validator(mode="before")
