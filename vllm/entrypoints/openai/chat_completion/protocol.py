@@ -677,6 +677,27 @@ class ChatCompletionRequest(OpenAIBaseModel):
             reasoning_effort=self.reasoning_effort,
         )
 
+        # Moonshot Kimi K3 accepts a top-level `thinking` extension object,
+        # e.g. {"type": "enabled", "keep": "all", "effort": "low"}. vLLM's
+        # base request model keeps unknown top-level fields in `model_extra`
+        # but otherwise ignores them, so surface `thinking.effort` as the
+        # `thinking_effort` template kwarg here. It is set only when the caller
+        # did not already pass an explicit `thinking_effort` (so a native
+        # chat_template_kwargs value still wins) and takes precedence over the
+        # top-level `reasoning_effort` — the K3 renderer maps reasoning_effort
+        # onto thinking_effort via setdefault, so an already-present value wins.
+        thinking_ext = (self.model_extra or {}).get("thinking")
+        if isinstance(thinking_ext, dict):
+            effort = thinking_ext.get("effort")
+            enabled = thinking_ext.get("type", "enabled") != "disabled"
+            existing_kwargs = self.chat_template_kwargs or {}
+            if (
+                enabled
+                and effort is not None
+                and "thinking_effort" not in existing_kwargs
+            ):
+                extra_kwargs["thinking_effort"] = effort
+
         # When reasoning is requested, activate thinking for models whose
         # chat templates require explicit opt-in (e.g., Gemma4 defaults
         # enable_thinking to false). For templates that don't declare the
