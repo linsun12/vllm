@@ -71,6 +71,15 @@ class ChatMessage(OpenAIBaseModel):
 
     # vLLM-specific fields that are not in OpenAI spec
     reasoning: str | None = None
+    reasoning_content: str | None = None
+    """Deprecated: use `reasoning` instead."""
+
+    @model_validator(mode="after")
+    def handle_deprecated_reasoning_content(self):
+        """Copy reasoning to reasoning_content for backward compatibility."""
+        if self.reasoning is not None:
+            self.reasoning_content = self.reasoning
+        return self
 
     @model_serializer(mode="wrap")
     def _serialize(self, handler):
