@@ -13,6 +13,7 @@ from pydantic import (
     BaseModel,
     ConfigDict,
     Field,
+    StrictBool,
     model_serializer,
     model_validator,
 )
@@ -143,7 +144,12 @@ class JsonSchemaResponseFormat(OpenAIBaseModel):
     # schema is the field in openai but that causes conflicts with pydantic so
     # instead use json_schema with an alias
     json_schema: dict[str, Any] | None = Field(default=None, alias="schema")
-    strict: bool | None = None
+    # strict defaults to true: guided decoding constrains the output to the
+    # schema. strict=false applies no grammar constraint, but the schema may
+    # still be rendered into the prompt by chat templates that consume
+    # response_format. StrictBool rejects non-boolean values (e.g. "yes")
+    # with a 400 instead of coercing them.
+    strict: StrictBool | None = None
 
 
 class LegacyStructuralTag(OpenAIBaseModel):
@@ -195,7 +201,13 @@ def structured_outputs_from_response_format(
     elif response_format.type == "json_schema":
         json_schema = response_format.json_schema
         assert json_schema is not None
-        overrides = {"json": json_schema.json_schema}
+        # strict=false means prompt-instruction-only: no grammar constraint
+        # is applied, but the schema may still be rendered into the prompt by
+        # chat templates that consume response_format. Default (None) and
+        # true keep full guided decoding.
+        overrides = (
+            {"json": json_schema.json_schema} if json_schema.strict is not False else {}
+        )
     else:
         assert isinstance(
             response_format,
@@ -207,6 +219,9 @@ def structured_outputs_from_response_format(
         overrides = {
             "structural_tag": json.dumps(response_format.model_dump(by_alias=True))
         }
+
+    if not overrides:
+        return structured_outputs
 
     if structured_outputs is None:
         return StructuredOutputsParams(**overrides)
