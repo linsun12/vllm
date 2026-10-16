@@ -7,17 +7,22 @@ them (aiter's preshuffled shared gate_up, its routed experts' layout).
 
 - The whole layer (K1 + K2) against aiter's fused mHC seams, the ROCm
   attention op chain (block-scaled FP8 GEMMs, the fused q norm / RoPE / KV
-  insert, the sparse MLA, the inverse-RoPE MXFP8 wo_a BMM), the TP
-  all-reduce and ``DeepseekV4MoE``, on a CSA layer (its top-k) and an HCA one
-  (every compressed row).
+  insert, the sparse MLA decode kernel the deployment runs, the inverse-RoPE
+  MXFP8 wo_a BMM), the TP all-reduce and ``DeepseekV4MoE``, on CSA layers
+  (their top-k) and HCA ones (every compressed row), bias- and hash-routed,
+  from one row to the widest step, one- and two-hop all-reduce.
 - The FFN launch, from wo_b's unreduced output, against the same FFN half,
-  on a bias-routed layer and a hash-routed one.
+  on a bias-routed layer, a hash-routed one and one whose shared expert's
+  output is on the routed sum's order.
 
 Each stage is compared on its own input, so a failure names the stage. The
 kernels quantize activations as MXFP8 (E8M0 a 32), where vLLM's FP8 GEMMs take
 fp32 scales a 128: where the two differ by more than rounding, each is
 measured against the exact fp32 result and the kernels must be as close to it
-as vLLM is."""
+as vLLM is. The MoE output's routed part must be scaled as vLLM's (a fit on
+the exact routed and shared parts), which a scale error moves and rounding does
+not. Every launch is then replayed from one graph 10,000 times, each replay
+checked bit for bit inside the graph."""
 
 import pytest
 import ray
@@ -37,7 +42,18 @@ Q_RANK, HEAD_DIM, NOPE, ROPE = 1536, 512, 448, 64
 N_HEADS, O_GROUPS, O_RANK = 128, 16, 1024
 WINDOW, TOPK, SWA_BLOCK, CACHE_BLOCK = 128, 1024, 64, 256
 RECORD, DATA, ALIGN = 584, 576, 576
-REPLAYS = 200
+# the FFN launch's widths: one row, a DSpark request (1 + 6), the widths around
+# the two-hop all-reduce's first (42), the widest step
+FFN_ROWS = (1, 7, 28, 41, 42, 56, 64)
+# graph replays, each checked bit for bit inside the graph: the host syncs
+# once, after all of them, so the launches run on a deep queue
+REPLAYS = 10_000
+# the MoE output's routed / shared scales (``_scales``) against vLLM's
+SCALE_TOL = 0.003
+SHARED_SCALE_TOL = 0.015
+# the shared down_proj's scale codes 2^9 up: with the routed experts' ranges
+# the shared expert's output is ~1/400 of the MoE output, where its errors vanish
+SHARED_LO = 125
 
 
 def _on_cdna4() -> bool:
@@ -60,19 +76,24 @@ def _rel(a: torch.Tensor, b: torch.Tensor) -> float:
     return ((a - b).norm() / b.norm()).item()
 
 
-def _random_moe(moe, gd, gr, vocab: int) -> None:
+def _random_moe(moe, gd, gr, vocab: int, shared_lo: int = 116) -> None:
     """Random parameters in the loaded layout, before post-load processing: this
     rank's shards (``gd``, a device generator) of the MXFP4 routed experts
     (random nibbles, E8M0 scales) and the FP8 shared expert (one E8M0 a
     128 x 128 block); the replicated router from ``gr``, seeded alike on every
-    rank (a hash layer's table: distinct experts a token)."""
+    rank (a hash layer's table: distinct experts a token). ``shared_lo``: the
+    shared down_proj's lowest scale code (``SHARED_LO`` puts the shared
+    expert's output on the routed sum's order)."""
     u8 = torch.uint8
-    for lin in (moe.shared_experts.gate_up_proj, moe.shared_experts.down_proj):
+    sh = moe.shared_experts
+    for lin, lo in ((sh.gate_up_proj, 116), (sh.down_proj, shared_lo)):
         w = torch.randn(lin.weight.shape, generator=gd, device=gd.device)
         lin.weight.data.copy_(w.clamp(-6, 6).to(lin.weight.dtype))
         sc = lin.weight_scale_inv.data.view(u8)
         sc.copy_(
-            torch.randint(116, 121, sc.shape, generator=gd, device=gd.device, dtype=u8)
+            torch.randint(
+                lo, lo + 5, sc.shape, generator=gd, device=gd.device, dtype=u8
+            )
         )
     e = moe.experts.routed_experts
     for name, lo, hi in (("weight", 0, 256), ("weight_scale", 118, 122)):
@@ -327,6 +348,13 @@ class _ExactMoE:
         return torch.nn.functional.silu(g) * u
 
     def __call__(self, x: torch.Tensor, route: torch.Tensor | None) -> torch.Tensor:
+        routed, shared = self.parts(x, route)
+        return routed + shared
+
+    def parts(
+        self, x: torch.Tensor, route: torch.Tensor | None
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """(the routed experts' sum, the shared expert's output) on this rank."""
         moe, x = self.moe, x.float()
         scores = torch.nn.functional.softplus(x @ moe.gate.weight.float().T).sqrt()
         if route is None:
@@ -336,12 +364,63 @@ class _ExactMoE:
             ids = route.long()
         w = scores.gather(1, ids)
         w = w / w.sum(1, keepdim=True) * moe.routed_scaling_factor
-        out = self._swiglu(x @ self.sgu.T) @ self.sd.T
+        shared = self._swiglu(x @ self.sgu.T) @ self.sd.T
+        routed = torch.zeros_like(shared)
         for t in range(x.shape[0]):
             w13, w2 = self._experts(self.w13, ids[t]), self._experts(self.w2, ids[t])
             act = self._swiglu(torch.einsum("knh,h->kn", w13, x[t]))
-            out[t] += (w[t, :, None] * torch.einsum("khn,kn->kh", w2, act)).sum(0)
-        return out
+            routed[t] = (w[t, :, None] * torch.einsum("khn,kn->kh", w2, act)).sum(0)
+        return routed, shared
+
+
+def _scales(out: torch.Tensor, routed: torch.Tensor, shared: torch.Tensor):
+    """The least-squares (routed, shared) scales of ``out`` on the exact MoE's
+    two parts: a path's rounding moves them by ~1e-3, a scale error in either
+    part one for one (the routed scale 2% off: 1.02)."""
+    a = torch.stack([routed.reshape(-1), shared.reshape(-1)], 1).double()
+    fit = torch.linalg.lstsq(a, out.reshape(-1, 1).double()).solution
+    return fit[0, 0].item(), fit[1, 0].item()
+
+
+def _check_moe(tag, out, same_in, routed, shared, real_shared=False) -> None:
+    """The kernels' MoE output ``out`` against vLLM's on the same input
+    (``same_in``), both against the exact MoE's (routed, shared) parts of that
+    input (reduced): as close to it as vLLM is, near vLLM's, and the routed
+    part scaled as vLLM scales it (a 2% routed-scale error moves the scale
+    ~0.02, rounding < 1e-3). ``real_shared``: a shared expert on the routed
+    sum's order, whose MXFP8 activations (vLLM's: FP8 a 128, fp32 scales) put
+    the outputs ~5% apart; its scale is then checked too, from a DSpark
+    request's rows (one row's fit is ~0.013 off)."""
+    ref = routed + shared
+    err_v, err_m = _rel(same_in, ref), _rel(out, ref)
+    (rm, sm), (rv, sv) = _scales(out, routed, shared), _scales(same_in, routed, shared)
+    cos, rel = (0.998, 0.065) if real_shared else (0.999, 0.03)
+    assert err_m < 1.1 * err_v + 2e-3, (tag, err_m, err_v)
+    assert _cos(out, same_in) > cos and _rel(out, same_in) < rel, tag
+    assert abs(rm - rv) < SCALE_TOL, (tag, "routed scale", rm, rv)
+    if real_shared and out.shape[0] > 1:
+        assert abs(sm - sv) < SHARED_SCALE_TOL, (tag, "shared scale", sm, sv)
+
+
+def _replay(steps, device) -> None:
+    """Every step's outputs under ``REPLAYS`` replays of one graph of all the
+    steps, each replay compared bit for bit with the eager run inside the graph
+    (a device mismatch count an output): no host sync until the last."""
+    outs = [t for step in steps for t in step()]
+    torch.accelerator.synchronize()
+    ref = [t.clone() for t in outs]
+    bad = torch.zeros(len(outs), dtype=torch.int64, device=device)
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        for step in steps:
+            step()
+        for j, (t, r) in enumerate(zip(outs, ref)):
+            bad[j] += (t != r).sum()
+    for _ in range(REPLAYS):
+        graph.replay()
+    torch.accelerator.synchronize()
+    bad_outs = bad.nonzero().flatten().tolist()
+    assert not bad_outs, f"outputs {bad_outs} differ from the first run"
 
 
 @ray.remote(num_gpus=1, max_calls=1)
@@ -407,7 +486,9 @@ def _check_ffn(rank: int, tp: int, device) -> None:
     norm = (1 + f32(HIDDEN, s=0.1)).to(bf)
 
     steps = []
-    for layer in (3, 0):  # a bias-routed layer, then a hash-routed one
+    # a bias-routed layer, a hash-routed one, and a bias-routed one whose shared
+    # expert's output is on the routed sum's order
+    for layer, shared_lo in ((3, 116), (0, 116), (4, SHARED_LO)):
         with set_current_vllm_config(vc), set_default_torch_dtype(bf), device:
             moe = DeepseekV4MoE(vc, prefix=f"model.layers.{layer}.ffn")
         _random_moe(
@@ -415,6 +496,7 @@ def _check_ffn(rank: int, tp: int, device) -> None:
             torch.Generator(device=device).manual_seed(2001 + rank + 10 * layer),
             torch.Generator(device=device).manual_seed(2000 + layer),
             cfg.vocab_size,
+            shared_lo,
         )
         exact = _ExactMoE(moe)  # the weights as loaded, before processing
         process_weights_after_loading(moe, vc.model_config, device)
@@ -440,7 +522,7 @@ def _check_ffn(rank: int, tp: int, device) -> None:
             with set_forward_context(None, vc):
                 return moe(x.clone(), ids)
 
-        for M in (7, 28, 56):
+        for M in FFN_ROWS:
             gi = torch.Generator().manual_seed(11 + M)
             res = torch.randn(M, HC, HIDDEN, generator=gi)
             res = (res * torch.rsqrt(res.pow(2).mean(-1, keepdim=True))).to(bf)
@@ -470,7 +552,7 @@ def _check_ffn(rank: int, tp: int, device) -> None:
             # the FFN launch
             pre_dummy = torch.zeros(M, HC, device=device)
             f = runner.ffn(mw, part, res, post, comb, pre_dummy, route_ids=route)
-            tag = f"layer {layer}, M {M}"
+            tag = f"layer {layer}, M {M}, shared x{2 ** (shared_lo - 116)}"
             # the seam: the residual vLLM's; the gate's mixes the fp32 reference
             # of that residual's (aiter's fused seam is ~2e-3 off it: post / comb
             # only loosely against vLLM's)
@@ -494,10 +576,11 @@ def _check_ffn(rank: int, tp: int, device) -> None:
             # activations): the kernels' MXFP8 / bf16 roundings are not vLLM's
             # (its shared expert quantizes per 128 with fp32 scales), so they
             # must be as close to it as vLLM is, and near vLLM's
-            ref = tensor_model_parallel_all_reduce(exact(normed, route))
-            err_v, err_m = _rel(same_in, ref), _rel(f[0], ref)
-            assert err_m < 1.1 * err_v + 2e-3, (tag, err_m, err_v)
-            assert _cos(f[0], same_in) > 0.999 and _rel(f[0], same_in) < 0.03, tag
+            routed, shared = map(
+                tensor_model_parallel_all_reduce, exact.parts(normed, route)
+            )
+            real = shared_lo == SHARED_LO
+            _check_moe(tag, f[0], same_in, routed, shared, real_shared=real)
             assert _cos(f[0], out) > 0.99, tag
             outs = runner._outs(M, res)
 
@@ -511,21 +594,7 @@ def _check_ffn(rank: int, tp: int, device) -> None:
 
     # the hand-off protocol under back-to-back launches: every width and layer
     # in one graph, every replay bit for bit the first's
-    outs = [t for step in steps for t in step()]
-    torch.accelerator.synchronize()
-    ref = [t.clone() for t in outs]
-    graph = torch.cuda.CUDAGraph()
-    with torch.cuda.graph(graph):
-        for step in steps:
-            step()
-    for i in range(REPLAYS):
-        graph.replay()
-        if i % 50 == 49 or i == REPLAYS - 1:
-            torch.accelerator.synchronize()
-            bad = [
-                j for j, (t, r) in enumerate(zip(outs, ref)) if not torch.equal(t, r)
-            ]
-            assert not bad, f"replay {i}: outputs {bad} differ from the first run"
+    _replay(steps, device)
 
 
 class _ExactAttention:
@@ -649,6 +718,7 @@ def _check_layer(rank: int, tp: int, device) -> None:
     from vllm.utils.torch_utils import set_default_torch_dtype
     from vllm.v1.attention.ops.rocm_aiter_mla_sparse import (
         build_ragged_indices_from_dense,
+        rocm_sparse_attn_decode,
     )
 
     vc = EngineArgs(
@@ -674,20 +744,21 @@ def _check_layer(rank: int, tp: int, device) -> None:
     )
     with set_current_vllm_config(vc):
         fused = MHCFusedPostPreOp()
-    with set_current_vllm_config(vc), set_default_torch_dtype(bf), device:
-        moe = DeepseekV4MoE(vc, prefix="model.layers.3.ffn")
-    _random_moe(
-        moe,
-        torch.Generator(device=device).manual_seed(2001 + rank),
-        torch.Generator(device=device).manual_seed(2000),
-        cfg.vocab_size,
-    )
-    exact_moe = _ExactMoE(moe)
-    process_weights_after_loading(moe, vc.model_config, device)
-    sh = moe.shared_experts
-    exact_moe.shared(sh)
-    sh.prepare_gateup_preshuffle()
-    e = moe.experts.routed_experts
+    moes, exact_moes = {}, {}
+    for layer in (3, 0):  # a bias-routed layer's MoE, a hash-routed one's
+        with set_current_vllm_config(vc), set_default_torch_dtype(bf), device:
+            moe = DeepseekV4MoE(vc, prefix=f"model.layers.{layer}.ffn")
+        _random_moe(
+            moe,
+            torch.Generator(device=device).manual_seed(2001 + rank + 10 * layer),
+            torch.Generator(device=device).manual_seed(2000 + layer),
+            cfg.vocab_size,
+        )
+        exact_moes[layer] = _ExactMoE(moe)
+        process_weights_after_loading(moe, vc.model_config, device)
+        exact_moes[layer].shared(moe.shared_experts)
+        moe.shared_experts.prepare_gateup_preshuffle()
+        moes[layer] = moe
 
     def f32(*shape, s=1.0, gen=g):
         return (torch.randn(*shape, generator=gen) * s).to(device)
@@ -720,9 +791,8 @@ def _check_layer(rank: int, tp: int, device) -> None:
         )  # fmt: skip
         return post, comb
 
-    def moe_out(x):
+    def moe_out(moe, x, ids):
         with set_forward_context(None, vc):
-            ids = torch.zeros(x.shape[0], dtype=torch.int64, device=device)
             return moe(x.clone(), ids)
 
     # the attention's weights, as vLLM holds them after loading and its
@@ -741,12 +811,22 @@ def _check_layer(rank: int, tp: int, device) -> None:
     exact_attn = _ExactAttention(w, eps, sink)
 
     steps = []
-    for ratio, R, T, width in (
-        (4, 1, 7, 0),
-        (128, 8, 7, hca_long),
-        (128, 2, 7, hca_dep),
-        (4, 4, 7, 0),
+    # (compress ratio, requests, tokens a request, key table width, MoE layer):
+    # CSA and HCA at both key table widths, the two-hop all-reduce from 42 rows,
+    # the widest step (64), a hash-routed layer's whole layer
+    for ratio, R, T, width, layer in (
+        (4, 1, 7, 0, 3),
+        (128, 8, 7, hca_long, 3),
+        (128, 2, 7, hca_dep, 3),
+        (4, 4, 7, 0, 3),
+        (4, 6, 7, 0, 3),
+        (4, 8, 8, 0, 0),
+        (128, 8, 8, hca_dep, 0),
+        (128, 1, 1, hca_dep, 0),
     ):
+        moe, exact_moe = moes[layer], exact_moes[layer]
+        sh, e = moe.shared_experts, moe.experts.routed_experts
+        hashed = moe.gate.tid2eid is not None
         with set_current_vllm_config(VllmConfig()):
             rope = build_deepseek_v4_rope(
                 cfg, head_dim=HEAD_DIM, rope_head_dim=ROPE,
@@ -756,11 +836,12 @@ def _check_layer(rank: int, tp: int, device) -> None:
         cos_sin = rope.cos_sin_cache.to(device=device, dtype=torch.float32)
         cos_bf, sin_bf = (c.contiguous() for c in cos_sin.to(bf).chunk(2, dim=-1))
         s = _decode_step(ratio, R, T, w["kv_norm"], cos_sin, seed=7 + ratio + R)
-        M, tag = s["M"], f"ratio {ratio}, {R} x {T}, width {width}"
+        M = s["M"]
+        tag = f"ratio {ratio}, {R} x {T}, width {width}, layer {layer}"
         hca = ratio == 128
         mw = MonoLayerWeights(
             attn=AttnWeights(
-                layer_id=3, wqkv=wqkv_sh, wqkv_scale=mx_scales(w["wqkv_s"], 128),
+                layer_id=layer, wqkv=wqkv_sh, wqkv_scale=mx_scales(w["wqkv_s"], 128),
                 q_norm=w["q_norm"], kv_norm=w["kv_norm"], wq_b=w["wq_b"],
                 wq_b_scale=mx_scales(w["wq_b_s"], 128), wo_a=w["wo_a"],
                 wo_a_scale=mx_scales(w["wo_a_s"], 128), wo_b=wo_b_sh,
@@ -793,6 +874,8 @@ def _check_layer(rank: int, tp: int, device) -> None:
         comb0 = comb0.to(device)
         post0 = (torch.sigmoid(torch.randn(M, HC, 1, generator=gi)) * 2).to(device)
         pre0 = torch.zeros(M, HC, device=device)
+        ids = torch.randint(0, cfg.vocab_size, (M,), generator=gi).to(device)
+        route = moe.gate.tid2eid[ids].contiguous() if hashed else None
         swa_v, swa_m = s["swa_cache"], _clone_cache(s["swa_cache"])
 
         # vLLM's decode chain
@@ -813,19 +896,27 @@ def _check_layer(rank: int, tp: int, device) -> None:
             s["swa_indices"].reshape(M, -1), s["swa_lens"]
         )
         if hca:
-            lens = (s["topk"] >= 0).sum(1).to(torch.int32)
-            top_ind, top_ptr = build_ragged_indices_from_dense(s["topk"], lens)
+            top_lens = (s["topk"] >= 0).sum(1).to(torch.int32)
+            top_ind, top_ptr = build_ragged_indices_from_dense(s["topk"], top_lens)
         else:
             valid = torch.ones(M, dtype=torch.bool, device=device)
-            top_ind, top_ptr, _ = compute_global_topk_ragged_indices_and_indptr(
+            top_ind, top_ptr, top_lens = compute_global_topk_ragged_indices_and_indptr(
                 s["topk"], s["token_to_req"], s["comp_block_table"],
                 s["comp_entries"], valid,
             )  # fmt: skip
+        # the decode kernel the deployment runs (``rocm.py`` ``_forward_decode``;
+        # aiter's Triton sparse MLA is opt-in): with the FP8 wo_a the inverse
+        # RoPE is wo_a's input quant's, below
         attn = torch.empty(M, H, HEAD_DIM, dtype=bf, device=device)
-        ops.triton_sparse_mla_fwd(
-            q_roped, swa_v, attn, HEAD_DIM**-0.5, swa_ptr, swa_ind,
-            attn_sink=sink, extra_kv_buffer=s["comp_cache"],
-            extra_kv_indptr=top_ptr, extra_kv_indices=top_ind,
+        rocm_sparse_attn_decode(
+            q=q_roped, kv_cache=s["comp_cache"], swa_k_cache=swa_v, swa_only=False,
+            topk_indices=s["topk"] if hca else None, topk_lens=top_lens,
+            swa_indices=s["swa_indices"], swa_lens=s["swa_lens"],
+            swa_ragged_indices=swa_ind, swa_ragged_indptr=swa_ptr,
+            topk_ragged_indices=top_ind, topk_ragged_indptr=top_ptr,
+            attn_sink=sink, scale=HEAD_DIM**-0.5, head_dim=HEAD_DIM,
+            nope_head_dim=NOPE, rope_head_dim=ROPE, output=attn,
+            extra_cache_nan_free=True,
         )  # fmt: skip
         o8, os_ = inverse_rope_group_quant(
             attn, s["positions"], cos_bf, sin_bf, num_groups=G, quant_group_size=128
@@ -845,7 +936,8 @@ def _check_layer(rank: int, tp: int, device) -> None:
             swa_m, s["swa_indices"], s["swa_lens"], s["token_to_req"],
             topk_indices=s["topk"], comp_cache=s["comp_cache"],
             comp_block_table=s["comp_block_table"],
-            select=lambda normed, qr: None, topk=width, global_keys=hca,
+            select=lambda normed, qr: None, route_ids=route, topk=width,
+            global_keys=hca,
         )  # fmt: skip
         torch.accelerator.synchronize()
         # the attention seam: the residual vLLM's, the mixes the fp32 reference's
@@ -892,17 +984,17 @@ def _check_layer(rank: int, tp: int, device) -> None:
         xk = runner.scratch(M, width)[off : off + M * HIDDEN * 2]
         xk = xk.view(bf).view(M, HIDDEN)
         assert _cos(xk, xf_m) > 0.999 and _rel(xk, xf_m) < 0.02, tag
-        mo = moe_out(xk)
-        ref = tensor_model_parallel_all_reduce(exact_moe(xk, None))
-        err_v, err_m = _rel(mo, ref), _rel(o[0], ref)
-        assert err_m < 1.1 * err_v + 2e-3, (tag, err_m, err_v)
-        assert _cos(o[0], mo) > 0.999, (tag, _cos(o[0], mo))
+        mo = moe_out(moe, xk, ids)
+        routed, shared = map(
+            tensor_model_parallel_all_reduce, exact_moe.parts(xk, route)
+        )
+        _check_moe(tag, o[0], mo, routed, shared)
 
         outs = runner._outs(M, res0)
         meta = dict(
             topk_indices=s["topk"], comp_cache=s["comp_cache"],
             comp_block_table=s["comp_block_table"], select=lambda n, q: None,
-            topk=width, global_keys=hca,
+            route_ids=route, topk=width, global_keys=hca,
         )  # fmt: skip
         args = (s["positions"], s["slot_mapping"], swa_m, s["swa_indices"],
                 s["swa_lens"], s["token_to_req"])  # fmt: skip
@@ -916,23 +1008,7 @@ def _check_layer(rank: int, tp: int, device) -> None:
 
     # the hand-off protocol under back-to-back launches: the layers' widths and
     # key tables alternating in one graph, every replay bit for bit the first's
-    outs = [t for step in steps for t in step()]
-    torch.accelerator.synchronize()
-    ref_outs = [t.clone() for t in outs]
-    graph = torch.cuda.CUDAGraph()
-    with torch.cuda.graph(graph):
-        for step in steps:
-            step()
-    for i in range(REPLAYS):
-        graph.replay()
-        if i % 50 == 49 or i == REPLAYS - 1:
-            torch.accelerator.synchronize()
-            bad = [
-                j
-                for j, (t, r) in enumerate(zip(outs, ref_outs))
-                if not torch.equal(t, r)
-            ]
-            assert not bad, f"replay {i}: outputs {bad} differ from the first run"
+    _replay(steps, device)
 
 
 @pytest.mark.skipif(not _on_cdna4(), reason="the mono kernels target CDNA4")

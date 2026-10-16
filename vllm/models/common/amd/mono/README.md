@@ -160,6 +160,11 @@ and the seams, and adds its own stages next to `attention/`.
 - Per layer against vLLM's own modules in a TP process group
   (`tests/models/test_dsv41_mono_numerics.py` at TP2 / TP4,
   `tests/models/test_dsv4_mono_numerics.py` at TP4 / TP8), the protocol under
-  graph replays; through the real model (`test_dsv41_mono_layers.py`).
+  graph replays (V4-Pro: 10,000 replays on a deep queue, each checked bit for
+  bit inside the graph); the MoE output's routed scale fit on the exact routed
+  and shared parts against vLLM's (a 2% scale error fails); through the real
+  model (`test_dsv41_mono_layers.py`; `test_dsv4_mono_layers.py`: eager steps,
+  and DSpark's 1 + 6 rows a request from FULL CUDA graphs, each launch against
+  vLLM's path in the same graph).
 - Bench: layers of one type back to back in one HIP graph, cold weights, us
   per layer; then e2e (gsm8k, AgentX as InferenceX runs it).

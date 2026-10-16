@@ -8,9 +8,11 @@ against vLLM's ops one stage at a time, this runs
 ``DeepseekV4DecoderLayer.forward`` in the engine -- the model's hook, the
 per-step path choice, the weights taken off the layer, the metadata, the
 compressor and the indexer's top-k -- so a change to the decoder layer that
-the kernels do not follow fails here. Scope: eager steps of one token a
-request; speculative decoding's multi-token rows and graph replays are not
-covered.
+the kernels do not follow fails here. ``test_mono_decode_matches_the_model``:
+eager steps of one token a request, the two engines compared.
+``test_mono_decode_matches_vllm_in_graphs``: the DSpark deployment's steps
+(1 + 6 rows a request) replayed from FULL CUDA graphs, each launch against
+vLLM's own path on the same inputs inside the same graph.
 
 The checkpoint's own first five layers (``compress_ratios`` 128, 128, 4, 128,
 4; ``num_hash_layers`` 3) hold every variant the kernels build, each taking the
@@ -25,6 +27,8 @@ A 32K ``max_model_len`` builds the HCA kernels 256 keys wide; the prompts
 kernels read a table narrower than they are built for.
 """
 
+import json
+import shutil
 import zlib
 
 import pytest
@@ -43,6 +47,17 @@ TRUNCATED = {
 }
 LAYERS = (0, 1, 2, 3, 4)
 STEPS = 5  # decode steps after the prefill's token
+# the DSpark deployment: 1 + 6 rows a request, FULL CUDA graphs
+CHECKED_LOAD_FORMAT = "dsv4_mono_random_checked"
+DSPARK = "deepseek-ai/DeepSeek-V4-Pro-DSpark"
+DSPARK_TRUNCATED = {
+    "num_hidden_layers": 5,
+    # one entry a layer, the three draft layers' included
+    "compress_ratios": [128, 128, 4, 128, 4, 0, 0, 0],
+    "dspark_target_layer_ids": [2, 3, 4],
+}
+NSPEC = 6
+SPEC_TOKENS = 24  # tokens a request: several verification steps
 
 
 def _on_cdna4() -> bool:
@@ -119,6 +134,99 @@ class RandomWeightLoader(DummyModelLoader):
                 for half in (0, padded):
                     w13[:, half + inter : half + padded] = 0
                 w2[..., inter // 2 :] = 0
+
+
+class _CheckedMono:
+    """A layer's mono path that also runs vLLM's path on the same inputs, after
+    it, in the same step (so in the same CUDA graph): vLLM's then writes the
+    step's KV records, compressor state and top-k last, which both read at the
+    next step, and the layer hands on the kernels' outputs. Each launch's rows
+    go to a device ring (graph-safe: a device counter picks the slot): valid
+    (a real token, not graph padding), x's and the residual's relative
+    difference, the mixes' largest, vLLM's routing margin (top-6 against the
+    7th score; none on a hash layer) and x's dot products for the scale fit."""
+
+    FIELDS = ("valid", "x", "residual", "mixes", "gap", "dot", "ref")
+    RING = 2048
+
+    def __init__(self, mono, layer) -> None:
+        self.mono = mono
+        dev = layer.ffn_norm.weight.device
+        rows = mono.SPEC.max_tokens
+        f32 = torch.float32  # the model's default dtype is bf16 here
+        self.rec = torch.zeros(self.RING, rows, len(self.FIELDS), dtype=f32, device=dev)
+        # (rows, a FULL graph's launch) a record
+        self.meta = torch.zeros(self.RING, 2, dtype=f32, device=dev)
+        self.count = torch.zeros(1, dtype=torch.int64, device=dev)
+        self.gap = torch.full((rows,), float("inf"), dtype=f32, device=dev)
+        layer.ffn.register_forward_pre_hook(self._margin, with_kwargs=True)
+
+    def __getattr__(self, name):
+        return getattr(self.mono, name)
+
+    def _margin(self, ffn, args, kwargs) -> None:
+        h = args[0] if args else kwargs["hidden_states"]
+        if ffn.gate.tid2eid is not None or h.shape[0] > self.gap.shape[0]:
+            return
+        logits = h.float() @ ffn.gate.weight.float().T
+        score = torch.nn.functional.softplus(logits).sqrt()
+        top = (score + ffn.gate.e_score_correction_bias.float()).topk(7, dim=-1).values
+        self.gap[: h.shape[0]].copy_(top[:, 5] - top[:, 6])
+
+    def __call__(self, layer, x, positions, input_ids, post_mix, res_mix, residual):
+        out = self.mono(layer, x, positions, input_ids, post_mix, res_mix, residual)
+        if out is None:
+            return None
+        M, attn = x.shape[0], layer.attn
+        _, swa, _ = self.mono.decode_step(attn.swa_cache_layer.prefix, attn.prefix, M)
+        ref = layer._forward_fused_post_pre(
+            x, positions, input_ids, post_mix, res_mix, residual
+        )
+        xm, xv = out[0].float(), ref[0].float()
+        rm, rv = out[1].float().reshape(M, -1), ref[1].float().reshape(M, -1)
+        mixes = torch.maximum(
+            (out[2].float() - ref[2].float()).reshape(M, -1).abs().amax(1),
+            (out[3].float() - ref[3].float()).reshape(M, -1).abs().amax(1),
+        )
+        row = torch.stack(
+            [
+                (swa.slot_mapping[:M] >= 0).float(),
+                (xm - xv).norm(dim=1) / xv.norm(dim=1),
+                (rm - rv).norm(dim=1) / rv.norm(dim=1),
+                mixes,
+                self.gap[:M],
+                (xm * xv).sum(1),
+                (xv * xv).sum(1),
+            ],
+            1,
+        )
+        # captured: every replay of the graph writes the 1
+        full = torch.cuda.is_current_stream_capturing()
+        slot = self.count % self.RING
+        rec = torch.zeros_like(self.rec[0])
+        rec[:M] = row
+        self.rec.index_copy_(0, slot, rec[None])
+        meta = torch.full((1, 2), float(M), dtype=torch.float32, device=x.device)
+        meta[:, 1] = float(full)
+        self.meta.index_copy_(0, slot, meta)
+        self.count.add_(1)
+        self.gap.fill_(float("inf"))
+        return out
+
+
+@register_model_loader(CHECKED_LOAD_FORMAT)
+class CheckedWeightLoader(RandomWeightLoader):
+    """``RandomWeightLoader``, and every mono layer checked against vLLM's path
+    in the engine (``_CheckedMono``): installed at load, ahead of the CUDA graph
+    captures."""
+
+    def load_weights(self, model, model_config) -> None:
+        from vllm.models.deepseek_v4.amd.model import DeepseekV4DecoderLayer
+
+        super().load_weights(model, model_config)
+        for m in model.modules():
+            if isinstance(m, DeepseekV4DecoderLayer) and m.mono is not None:
+                m.mono = _CheckedMono(m.mono, m)
 
 
 class MonoProbe:
@@ -218,6 +326,25 @@ class MonoProbe:
             "layers": layers,
             "epoch": -1 if runner is None else int(runner.epoch[0]),
         }
+
+    def reset_checks(self) -> None:
+        """Forget the checks of the engine's warmup (dummy inputs)."""
+        torch.accelerator.synchronize()
+        for m in self._decoder_layers().values():
+            if isinstance(m.mono, _CheckedMono):
+                m.mono.count.zero_()
+
+    def mono_checks(self) -> dict:
+        """Each layer's (launches, [n, rows, fields] records, [n, 2] meta) of
+        the ``_CheckedMono`` launches since ``reset_checks``."""
+        torch.accelerator.synchronize()
+        out = {}
+        for i, m in self._decoder_layers().items():
+            c = m.mono
+            n = int(c.count)
+            k = min(n, c.RING)
+            out[i] = (n, c.rec[:k].tolist(), c.meta[:k].tolist())
+        return out
 
 
 def _decode(vllm_runner, monkeypatch, tp: int, mono: bool, prompts, path: str):
@@ -356,3 +483,105 @@ def test_mono_decode_matches_the_model(vllm_runner, monkeypatch, tmp_path, tp):
                     assert gap < tie, (rank, i, k, "x", err, gap, tie)
                     flipped.add(k)
         assert len(flipped) <= len(keys) // 2, (rank, sorted(flipped))
+
+
+def _truncated_dspark(path) -> str:
+    """The DSpark checkpoint's configuration and tokenizer, truncated
+    (``DSPARK_TRUNCATED``), in a directory of its own: the drafter takes the
+    target layers from the checkpoint's config, past ``hf_overrides``."""
+    from vllm.transformers_utils.repo_utils import hf_api
+
+    src = hf_api().snapshot_download(DSPARK, allow_patterns=["*.json", "encoding/*"])
+    shutil.copytree(src, path, ignore=shutil.ignore_patterns("*.safetensors*"))
+    with open(f"{path}/config.json") as f:
+        config = json.load(f)
+    config.update(DSPARK_TRUNCATED)
+    with open(f"{path}/config.json", "w") as f:
+        json.dump(config, f)
+    return str(path)
+
+
+@pytest.mark.skipif(not _on_cdna4(), reason="the mono kernels target CDNA4")
+@pytest.mark.parametrize("tp", [4, 8])
+def test_mono_decode_matches_vllm_in_graphs(vllm_runner, monkeypatch, tmp_path, tp):
+    """The DSpark deployment's decode steps -- 1 + 6 rows a request (up to the
+    two-hop widths), replayed from FULL CUDA graphs -- each mono launch against
+    vLLM's own path on the same inputs, in the same graph (``_CheckedMono``).
+    Every layer sees the same inputs on both paths, so each is held to the
+    other test's layer-0 bounds."""
+    if torch.accelerator.device_count() < tp:
+        pytest.skip(f"needs {tp} GPUs")
+    pytest.importorskip("flydsl")
+    from vllm import SamplingParams
+    from vllm.inputs import TokensPrompt
+
+    g = torch.Generator().manual_seed(0)
+    jitter = torch.randint(256, (8,), generator=g).tolist()
+    lens = [4400 + 512 * i + r for i, r in enumerate(jitter)]
+    prompts = [torch.randint(1000, 60000, (n,), generator=g).tolist() for n in lens]
+    monkeypatch.setenv("VLLM_ROCM_USE_AITER", "1")
+    monkeypatch.setenv("VLLM_ROCM_USE_AITER_MOE", "1")
+    monkeypatch.setenv("VLLM_ROCM_USE_AITER_LINEAR", "1")
+    monkeypatch.setenv("VLLM_ROCM_USE_AITER_FUSION_SHARED_EXPERTS", "0")
+    monkeypatch.setenv("VLLM_ROCM_FP8_PADDING", "1")
+    rows = 1 + NSPEC
+    with vllm_runner(
+        _truncated_dspark(tmp_path / "model"),
+        tensor_parallel_size=tp,
+        load_format=CHECKED_LOAD_FORMAT,
+        worker_extension_cls=f"{__name__}.MonoProbe",
+        moe_backend="aiter",
+        monokernel=True,
+        kv_cache_dtype="fp8",
+        block_size=256,
+        tokenizer_mode="deepseek_v4",
+        max_model_len=32768,
+        max_num_seqs=len(prompts),
+        max_num_batched_tokens=32768,
+        enable_prefix_caching=False,
+        gpu_memory_utilization=0.5,
+        speculative_config={"method": "dspark", "num_speculative_tokens": NSPEC},
+        compilation_config={
+            "cudagraph_mode": "FULL_AND_PIECEWISE",
+            "cudagraph_capture_sizes": [rows, 2 * rows, 4 * rows, 8 * rows],
+        },
+    ) as runner:
+        llm = runner.llm
+        llm.collective_rpc("reset_checks")
+        params = SamplingParams(
+            temperature=0.0, max_tokens=SPEC_TOKENS, ignore_eos=True
+        )
+        llm.generate([TokensPrompt(prompt_token_ids=p) for p in prompts], params)
+        checks = llm.collective_rpc("mono_checks")
+        probe = llm.collective_rpc("mono_layers")
+
+    for rank in probe:
+        assert rank["layers"] == dict.fromkeys(LAYERS, True), rank
+    for rank, layers in enumerate(checks):
+        counts = {i: layers[i][0] for i in LAYERS}
+        # every layer took the kernels at every decode step
+        assert len(set(counts.values())) == 1 and counts[0] >= 4, (rank, counts)
+        assert counts[0] <= _CheckedMono.RING, (rank, counts)
+        for i in LAYERS:
+            rec, meta = (torch.tensor(t) for t in layers[i][1:])
+            width, graph = meta[:, 0].long(), meta[:, 1] > 0
+            # the launches replayed from FULL graphs, at multi-token widths
+            # past one request
+            multi = graph & (width % rows == 0) & (width >= 2 * rows)
+            assert multi.any(), (rank, i, width.tolist(), graph.tolist())
+            valid = rec[..., 0] > 0
+            x, res, mixes, gap, dot, ref = (rec[..., j][valid] for j in range(1, 7))
+            # the residual and mixes (set before the MoE): ~4x the most
+            # measured (0.24% / 0.014)
+            assert res.max() < 0.01, (rank, i, "residual", res.max())
+            assert mixes.max() < 0.05, (rank, i, "mixes", mixes.max())
+            # a row past 7% (5.4% the most measured) only where vLLM's routing
+            # is a near-tie (the other test's margin); at most half of them
+            near = gap < 2e-2 + 2 * res
+            off = x >= 0.07
+            assert near[off].all(), (rank, i, x[off], gap[off])
+            assert int((near & (x >= 0.05)).sum()) <= len(x) // 2, (rank, i)
+            # the MoE output's scale on vLLM's, off the near-ties: rounding
+            # keeps it within 1e-3, a 2% routed-scale error moves it 0.02
+            scale = (dot[~near].sum() / ref[~near].sum()).item()
+            assert abs(scale - 1) < 0.005, (rank, i, "scale", scale)
