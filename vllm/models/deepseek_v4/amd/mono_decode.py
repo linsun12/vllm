@@ -40,7 +40,7 @@ if TYPE_CHECKING:
 
 logger = init_logger(__name__)
 
-# DeepSeek-V4-Pro to the kernels: TP8, a step's rows at most 8 requests x
+# DeepSeek-V4-Pro to the kernels: TP4 or TP8, a step's rows at most 8 requests x
 # (1 + 6 DSpark drafts) and spare; vLLM's aiter path preshuffles wqkv, wo_b and
 # the shared gate_up, and norms each query head
 SPEC = MonoSpec(
@@ -118,7 +118,7 @@ class MonoDecodeLayer(MonoDecode):
     call, after loading and vLLM's preshuffle."""
 
     SPEC = SPEC
-    TP_SIZES = (8,)
+    TP_SIZES = (4, 8)
     LABEL = "DSv4"
 
     def __init__(self, hca_width: int) -> None:

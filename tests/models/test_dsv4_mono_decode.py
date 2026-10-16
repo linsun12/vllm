@@ -350,14 +350,14 @@ def test_off_without_the_flag(monkeypatch):
 @pytest.mark.parametrize(
     "case, match",
     [
-        (dict(tp=4), "tensor parallel size 8"),
+        (dict(tp=2), "tensor parallel size 4 or 8"),
         (dict(aiter_linear=False), "VLLM_ROCM_USE_AITER_LINEAR"),
         (dict(padding="0"), "VLLM_ROCM_FP8_PADDING"),
     ],
     ids=["tp", "aiter-linear", "fp8-padding"],
 )
 def test_opt_in_outside_the_kernels_raises(monkeypatch, case, match):
-    """The kernels read TP8 shards of vLLM's preshuffled, padded aiter FP8
+    """The kernels read TP4 / TP8 shards of vLLM's preshuffled, padded aiter FP8
     weights: any other deployment is an error, not garbage."""
     padding = case.get("padding")
     _deployment(monkeypatch, **{k: v for k, v in case.items() if k != "padding"})

@@ -1645,32 +1645,38 @@ def run_moe(c, key, bid, tls, tl0):
         stage_route(c, t)
     stamp(timeline, tls, tid, tl0 + 3)
     c["xl"], c["xsl"] = c["x8l"], c["x8sl"]
-    # a CTA's one shared unit (task, token tile) at most: straight-line code,
+    # a CTA's one shared unit (task, token tile) a round: straight-line code,
     # whose tile loads LLVM does not hoist into one live set as it would out of
     # a task loop (spills). A task's tiles in series on one CTA put three tiles'
-    # latency on the path down waits on (the weights read again a tile: L2 hits)
-    assert c["rs"].shared_units <= BLOCKS
-    unit = first_task(bid, shared0)
-    if unit < c["rs"].shared_units:
-        # the gate weights in flight before x's wait
-        a = c["args"]
-        gops = gemv_fp8_loads(
-            c,
-            a["sgu"],
-            a["sgu_s"],
-            c["d"].hidden,
-            unit % shared_tasks,
-            row_major=not c["d"].spec.preshuffled,
-        )
-        if const_expr(not multi):
-            load_x8_rows(c, "x8", "x8s", c["x8l"], c["x8sl"], lambda j: j, s)
-            stage_shared(c, unit, gops, 0, s)
-        else:
-            x_tile = c["rs"].x_tile
-            t0 = unit // shared_tasks * x_tile
-            n = fx.min(fx.Int32(x_tile), s - t0)
-            load_x8_rows(c, "x8", "x8s", c["x8l"], c["x8sl"], lambda j: t0 + j, n)
-            stage_shared(c, unit % shared_tasks, gops, t0, n)
+    # latency on the path down waits on (the weights read again a tile: L2 hits),
+    # so a second round only where the units outnumber the CTAs. An odd task
+    # polls its even partner only, which polls nothing: no round order deadlocks
+    for r in range_constexpr(c["rs"].shared_rounds):
+        unit = first_task(bid, shared0)
+        if const_expr(r > 0):
+            unit = unit + r * BLOCKS
+        if unit < c["rs"].shared_units:
+            # the gate weights in flight before x's wait
+            a = c["args"]
+            gops = gemv_fp8_loads(
+                c,
+                a["sgu"],
+                a["sgu_s"],
+                c["d"].hidden,
+                unit % shared_tasks,
+                row_major=not c["d"].spec.preshuffled,
+            )
+            if const_expr(not multi):
+                load_x8_rows(c, "x8", "x8s", c["x8l"], c["x8sl"], lambda j: j, s)
+                stage_shared(c, unit, gops, 0, s)
+            else:
+                x_tile = c["rs"].x_tile
+                t0 = unit // shared_tasks * x_tile
+                n = fx.min(fx.Int32(x_tile), s - t0)
+                load_x8_rows(
+                    c, "x8", "x8s", c["x8l"], c["x8sl"], lambda j, t0=t0: t0 + j, n
+                )
+                stage_shared(c, unit % shared_tasks, gops, t0, n)
     stamp(timeline, tls, tid, tl0 + 4)
     c["xl"], c["xsl"] = c["x8rl"], c["x8rsl"]
     if const_expr(multi):

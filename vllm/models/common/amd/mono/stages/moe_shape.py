@@ -163,6 +163,12 @@ class RouteShape:
         return self.dims.shared_tasks * self.x_tiles
 
     @property
+    def shared_rounds(self) -> int:
+        """A CTA's shared units at most: one while they fit the grid (V4-Pro at
+        TP4 from 41 rows: 48 tasks x 6-8 tiles, two)."""
+        return -(-self.shared_units // BLOCKS)
+
+    @property
     def ug0(self) -> int:
         """The first ug round's placement: the shared units' CTAs last."""
         return self.shared0 + self.shared_units

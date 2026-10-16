@@ -9,7 +9,7 @@ subclass (see "Adding a model"):
 | model | docking | TP | layers |
 | --- | --- | --- | --- |
 | DeepSeek-V4.1-Flash | `models/deepseek_v41/amd/mono_decode.py` | 2, 4 | all 40 (ratio 0 / 1 / 2, index sources, Engram) |
-| DeepSeek-V4-Pro | `models/deepseek_v4/amd/mono_decode.py` | 8 | all 61 (CSA ratio 4, HCA ratio 128, 3 hash layers) |
+| DeepSeek-V4-Pro | `models/deepseek_v4/amd/mono_decode.py` | 4, 8 | all 61 (CSA ratio 4, HCA ratio 128, 3 hash layers) |
 
 A layer outside the whole-layer kernels keeps vLLM's attention and runs the
 rest -- the attention all-reduce, the FFN seam, the MoE and its all-reduce --
@@ -159,7 +159,7 @@ and the seams, and adds its own stages next to `attention/`.
 
 - Per layer against vLLM's own modules in a TP process group
   (`tests/models/test_dsv41_mono_numerics.py` at TP2 / TP4,
-  `tests/models/test_dsv4_mono_numerics.py` at TP8), the protocol under
+  `tests/models/test_dsv4_mono_numerics.py` at TP4 / TP8), the protocol under
   graph replays; through the real model (`test_dsv41_mono_layers.py`).
 - Bench: layers of one type back to back in one HIP graph, cold weights, us
   per layer; then e2e (gsm8k, AgentX as InferenceX runs it).

@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """The DeepSeek-V4-Pro mono decode path through the real model: a five-layer
-DeepSeek-V4-Pro at TP8 on CDNA4, served with ``--monokernel`` on and off on
+DeepSeek-V4-Pro at TP4 and TP8 on CDNA4, served with ``--monokernel`` on and off on
 the same random weights: every decoder layer's outputs at every decode step
 must match. Unlike ``test_dsv4_mono_numerics.py``, which checks the kernels
 against vLLM's ops one stage at a time, this runs
@@ -35,7 +35,6 @@ from vllm.model_executor.model_loader.dummy_loader import DummyModelLoader
 from vllm.platforms import current_platform
 
 MODEL = "deepseek-ai/DeepSeek-V4-Pro"
-TP = 8
 LOAD_FORMAT = "dsv4_mono_random"
 TRUNCATED = {
     "num_hidden_layers": 5,
@@ -221,7 +220,7 @@ class MonoProbe:
         }
 
 
-def _decode(vllm_runner, monkeypatch, mono: bool, prompts, path: str):
+def _decode(vllm_runner, monkeypatch, tp: int, mono: bool, prompts, path: str):
     """Greedy decode of ``prompts`` with the mono path on or off: (each
     prompt's output, the workers' mono layers); each decoder layer's outputs
     for the decode tokens of decode-only steps, and vLLM's routing margins,
@@ -237,7 +236,7 @@ def _decode(vllm_runner, monkeypatch, mono: bool, prompts, path: str):
     monkeypatch.setenv("VLLM_ROCM_FP8_PADDING", "1")
     with vllm_runner(
         MODEL,
-        tensor_parallel_size=TP,
+        tensor_parallel_size=tp,
         load_format=LOAD_FORMAT,
         hf_overrides=TRUNCATED,
         worker_extension_cls=f"{__name__}.MonoProbe",
@@ -275,9 +274,10 @@ def _rel(a: torch.Tensor, b: torch.Tensor) -> float:
 
 
 @pytest.mark.skipif(not _on_cdna4(), reason="the mono kernels target CDNA4")
-def test_mono_decode_matches_the_model(vllm_runner, monkeypatch, tmp_path):
-    if torch.accelerator.device_count() < TP:
-        pytest.skip(f"needs {TP} GPUs")
+@pytest.mark.parametrize("tp", [4, 8])
+def test_mono_decode_matches_the_model(vllm_runner, monkeypatch, tmp_path, tp):
+    if torch.accelerator.device_count() < tp:
+        pytest.skip(f"needs {tp} GPUs")
     pytest.importorskip("flydsl")
     g = torch.Generator().manual_seed(0)
     # contexts past the CSA layers' 1024 top-k (4 tokens a compressed entry),
@@ -286,9 +286,11 @@ def test_mono_decode_matches_the_model(vllm_runner, monkeypatch, tmp_path):
     lens = [4400 + 512 * i + r for i, r in enumerate(jitter)]
     prompts = [torch.randint(1000, 60000, (n,), generator=g).tolist() for n in lens]
 
-    on, probe_on = _decode(vllm_runner, monkeypatch, True, prompts, f"{tmp_path}/on")
+    on, probe_on = _decode(
+        vllm_runner, monkeypatch, tp, True, prompts, f"{tmp_path}/on"
+    )
     off, probe_off = _decode(
-        vllm_runner, monkeypatch, False, prompts, f"{tmp_path}/off"
+        vllm_runner, monkeypatch, tp, False, prompts, f"{tmp_path}/off"
     )
 
     # every layer took the mono path on every rank, at every decode step
@@ -327,7 +329,7 @@ def test_mono_decode_matches_the_model(vllm_runner, monkeypatch, tmp_path):
     # reach a near-tie by layer 4 (every one within its margin); at most half
     # may. A layer the kernels no longer follow is off by far more, on every
     # token.
-    for rank in range(TP):
+    for rank in range(tp):
         got, _ = torch.load(f"{tmp_path}/on.rank{rank}")
         want, gaps = torch.load(f"{tmp_path}/off.rank{rank}")
         keys: list[tuple[int, int]] = sorted(

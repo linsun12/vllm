@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""Numerics of the DeepSeek-V4-Pro mono decode kernels at TP8 on CDNA4 against
+"""Numerics of the DeepSeek-V4-Pro mono decode kernels at TP4 / TP8 on CDNA4 against
 the ops vLLM runs for the same decode step: random weights in the checkpoint's
 formats (FP8 128 x 128 blocks, MXFP4 experts), processed as vLLM processes
 them (aiter's preshuffled shared gate_up, its routed experts' layout).
@@ -32,7 +32,6 @@ from ..utils import (
 )
 
 MODEL = "deepseek-ai/DeepSeek-V4-Pro"
-TP = 8
 HIDDEN, HC = 7168, 4
 Q_RANK, HEAD_DIM, NOPE, ROPE = 1536, 512, 448, 64
 N_HEADS, O_GROUPS, O_RANK = 128, 16, 1024
@@ -937,16 +936,18 @@ def _check_layer(rank: int, tp: int, device) -> None:
 
 
 @pytest.mark.skipif(not _on_cdna4(), reason="the mono kernels target CDNA4")
-def test_mono_decode_layer_matches_vllm(monkeypatch: pytest.MonkeyPatch):
-    if torch.accelerator.device_count() < TP:
-        pytest.skip(f"needs {TP} GPUs")
+@pytest.mark.parametrize("tp", [4, 8])
+def test_mono_decode_layer_matches_vllm(monkeypatch: pytest.MonkeyPatch, tp: int):
+    if torch.accelerator.device_count() < tp:
+        pytest.skip(f"needs {tp} GPUs")
     pytest.importorskip("flydsl")
-    multi_process_parallel(monkeypatch, TP, 1, _mono_layer_numerics)
+    multi_process_parallel(monkeypatch, tp, 1, _mono_layer_numerics)
 
 
 @pytest.mark.skipif(not _on_cdna4(), reason="the mono kernels target CDNA4")
-def test_mono_ffn_launch_matches_vllm(monkeypatch: pytest.MonkeyPatch):
-    if torch.accelerator.device_count() < TP:
-        pytest.skip(f"needs {TP} GPUs")
+@pytest.mark.parametrize("tp", [4, 8])
+def test_mono_ffn_launch_matches_vllm(monkeypatch: pytest.MonkeyPatch, tp: int):
+    if torch.accelerator.device_count() < tp:
+        pytest.skip(f"needs {tp} GPUs")
     pytest.importorskip("flydsl")
-    multi_process_parallel(monkeypatch, TP, 1, _mono_numerics)
+    multi_process_parallel(monkeypatch, tp, 1, _mono_numerics)
